@@ -4,7 +4,7 @@ A serverless AI coding assistant that lives directly inside your Gmail inbox.
 
 CodeAgent turns an email into a persistent coding job: it reads your instructions and attached source files, sends the work to the Groq API, processes the job through a durable state machine, generates a finished HTML artifact, and emails the result back with a live Web App preview.
 
-> **Status:** Experimental / personal project. CodeAgent is designed to stay lightweight and inexpensive, but Google Apps Script and Groq quotas still apply.
+> **Current release: v8** — reliability and output-integrity hardening.
 
 ## ✨ Features
 
@@ -16,7 +16,9 @@ CodeAgent turns an email into a persistent coding job: it reads your instruction
 - **📎 Result attachments** — Completion emails include the generated HTML file as an attachment.
 - **🔁 Automatic trigger recovery** — The project maintains two managed triggers and can recreate a missing polling or worker trigger when the agent is enabled.
 - **🧯 Safe recovery tools** — Existing jobs can be recovered without deleting their generated artifacts.
-- **🔌 Future integration ready** — The queue architecture is designed so additional front ends can eventually feed the same worker pipeline.
+- **✅ Output validation** — v8 checks generated standalone HTML for required document structure and attempts a repair pass when the model truncates its output.
+- **🧠 Safer prompting** — v8 explicitly tells the model not to invent personal contact details, credentials, employers, hobbies, or other personal facts.
+- **🔎 Queue diagnostics** — `inspectQueuedJobs()` exposes job state, retry timestamps, delivery attempts, and recorded errors.
 
 ## 🧠 How It Works
 
@@ -43,7 +45,7 @@ resumeJobs
           └── result email → Gmail
 ```
 
-The important design choice is that Gmail intake and AI processing are separate. The Gmail poller only finds and queues work. The worker processes persisted jobs independently. This makes the system much more resilient to execution limits, rate limits, and temporary failures.
+The Gmail poller and worker are intentionally separated. The poller only finds and queues work. The worker processes persisted jobs independently. This makes the system much more resilient to execution limits, rate limits, and temporary failures.
 
 ## 🚀 Setup
 
@@ -57,7 +59,7 @@ The important design choice is that Gmail intake and AI processing are separate.
 
 1. In Apps Script, select **Deploy → New deployment**.
 2. Choose **Web app**.
-3. Configure the deployment so the intended users can access the preview.
+3. Configure access for the intended users.
 4. Deploy it and copy the resulting Web App URL.
 
 The Web App URL is used when CodeAgent creates the live preview link for completed HTML files.
@@ -81,9 +83,9 @@ Create a Gmail label named exactly:
 CodeAgent
 ```
 
-Then create a Gmail filter that applies the `CodeAgent` label to the messages you want CodeAgent to process. A simple approach is to send requests to yourself and use a keyword such as `[CODE]` in the subject.
+Create a Gmail filter that applies the `CodeAgent` label to the messages you want CodeAgent to process. A simple approach is to send requests to yourself and use a keyword such as `[CODE]` in the subject.
 
-The worker records the original message/thread information when a job is created so the final result can be routed back after processing.
+When a job is created, CodeAgent stores the source message/thread identifiers and the recipient address in the persistent job state.
 
 ### 5. Initialize and enable CodeAgent
 
@@ -106,7 +108,7 @@ This enables the agent and creates the two managed triggers:
 - `processCodeEmails` — Gmail intake every **5 minutes**.
 - `resumeJobs` — persistent worker every **1 minute**.
 
-You do **not** need to manually create a separate `processCodeEmails` trigger when using `enableCodeAgent()`.
+You do **not** need to manually create these triggers when using `enableCodeAgent()`.
 
 ### 6. Grant Drive permissions
 
@@ -122,7 +124,7 @@ CodeAgent uses Google Drive to persist job state and store generated HTML artifa
 
 Send yourself an email with the `CodeAgent` label applied.
 
-Put your coding instructions in the email body and attach source files when needed. CodeAgent can work with pasted code and supported text-based attachments such as HTML, CSS, and JavaScript.
+Put your coding instructions in the email body and attach source files when needed. CodeAgent can work with pasted code and supported text-based attachments such as HTML, CSS, JavaScript, JSON, Markdown, SVG, Vue, and Svelte files.
 
 A normal job looks like:
 
@@ -142,7 +144,7 @@ SEND_RESULT
 Completion email + HTML attachment + live preview
 ```
 
-Processing may take multiple worker executions for larger jobs. That is intentional: the job state is persisted between executions rather than relying on one long-running Apps Script invocation.
+A waiting job does not block unrelated jobs behind it. This is especially important when a transient Groq or Gmail retry timestamp is active.
 
 ## 🔧 Useful Admin Functions
 
@@ -152,7 +154,15 @@ Processing may take multiple worker executions for larger jobs. That is intentio
 showCodeAgentStatus();
 ```
 
-Reports the current enabled state, integration configuration, Gmail pause state, queue size, and managed triggers.
+Reports the enabled state, integration configuration, Gmail pause state, queue size, and managed triggers.
+
+### Inspect queued jobs
+
+```javascript
+inspectQueuedJobs();
+```
+
+Prints the current queue state, including job stage, retry time, chunk progress, recipient, delivery attempts, and recorded errors.
 
 ### Run one worker pass manually
 
@@ -168,7 +178,7 @@ Useful for testing or immediately processing an existing queued job without wait
 recoverStuckJobs();
 ```
 
-Resets pending `SEND_RESULT` / failure-delivery jobs so the normal worker can inspect them again without deleting the generated artifact.
+Resets pending `SEND_RESULT` / failure-delivery jobs so the normal worker can inspect them again without deleting their generated artifacts.
 
 ### Clear a temporary Gmail pause
 
@@ -186,6 +196,18 @@ emergencyStop();
 
 Disables CodeAgent and removes the managed triggers while preserving existing Drive jobs.
 
+## 🧪 v8 Reliability Changes
+
+v8 was tested against the failure modes encountered during development. The most important changes are:
+
+- Completion delivery uses the persisted `recipientEmail` instead of requiring the original Gmail thread to remain available.
+- A waiting job no longer prevents later jobs from being inspected.
+- Generated standalone HTML must contain the expected document structure before it is accepted as a finished result.
+- Truncated HTML receives a repair pass rather than being immediately treated as a successful artifact.
+- The coding prompt explicitly prohibits fabricated personal information.
+- Queue inspection is available through `inspectQueuedJobs()`.
+- Gmail quota failures are recorded in persistent state and retried instead of deleting the generated result.
+
 ## ⚠️ Quotas & Limitations
 
 CodeAgent is designed around persistence rather than trying to eliminate platform limits.
@@ -198,7 +220,7 @@ CodeAgent is designed around persistence rather than trying to eliminate platfor
 
 ## 📁 Repository
 
-The repository currently contains the Apps Script implementation in:
+The main Apps Script implementation is:
 
 ```text
 code.gs
