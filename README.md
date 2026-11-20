@@ -4,7 +4,7 @@ A serverless AI coding assistant that lives directly inside your Gmail inbox.
 
 CodeAgent turns an email into a persistent coding job: it reads your instructions and attached source files, sends the work to the Groq API, processes the job through a durable state machine, generates a finished HTML artifact, and emails the result back with a live Web App preview.
 
-> **Current release: v8** — reliability and output-integrity hardening.
+> **Current release: v9** — durability hardening: failure notices always reach a real inbox, orphaned results recover, and delivered messages can never be queued twice.
 
 ## ✨ Features
 
@@ -16,9 +16,13 @@ CodeAgent turns an email into a persistent coding job: it reads your instruction
 - **📎 Result attachments** — Completion emails include the generated HTML file as an attachment.
 - **🔁 Automatic trigger recovery** — The project maintains two managed triggers and can recreate a missing polling or worker trigger when the agent is enabled.
 - **🧯 Safe recovery tools** — Existing jobs can be recovered without deleting their generated artifacts.
-- **✅ Output validation** — v8 checks generated standalone HTML for required document structure and attempts a repair pass when the model truncates its output.
-- **🧠 Safer prompting** — v8 explicitly tells the model not to invent personal contact details, credentials, employers, hobbies, or other personal facts.
-- **🔎 Queue diagnostics** — `inspectQueuedJobs()` exposes job state, retry timestamps, delivery attempts, and recorded errors.
+- **✅ Output validation** — CodeAgent checks generated standalone HTML for required document structure and attempts a repair pass when the model truncates its output.
+- **🧠 Safer prompting** — CodeAgent explicitly tells the model not to invent personal contact details, credentials, employers, hobbies, or other personal facts.
+- **🔎 Queue diagnostics** — `inspectQueuedJobs()` exposes job state, retry timestamps, delivery attempts, result-lookup failures, and recorded errors.
+- **📬 Reliable failure notices** — failures are emailed to the persisted recipient, then the thread sender, then the script owner, so a job never dies silently.
+- **♻️ Orphan recovery** — a result file that cannot be read is retried, then reported instead of waiting forever; `recoverStuckJobs()` requeues it for another attempt.
+- **🚫 No duplicate jobs** — delivered message IDs are remembered, so a failed `markRead()` cannot make the same email run twice.
+- **⏳ Bounded queue lifetime** — jobs that stay unfinished for seven days are failed with a notice instead of occupying the queue.
 
 ## 🧠 How It Works
 
@@ -74,6 +78,8 @@ Open **Project Settings → Script properties** and add:
 | `WEB_APP_URL` | Your deployed Apps Script Web App URL |
 
 Do not commit your API key to GitHub.
+
+CodeAgent manages one additional property on its own: `PROCESSED_MESSAGE_IDS` records recently delivered Gmail messages so the same email cannot be queued twice. It is safe to delete, and it is rebuilt automatically.
 
 ### 4. Set up Gmail
 
@@ -162,7 +168,7 @@ Reports the enabled state, integration configuration, Gmail pause state, queue s
 inspectQueuedJobs();
 ```
 
-Prints the current queue state, including job stage, retry time, chunk progress, recipient, delivery attempts, and recorded errors.
+Prints the current queue state, including job stage, retry time, chunk progress, recipient, delivery attempts, result-lookup failures, and recorded errors.
 
 ### Run one worker pass manually
 
@@ -178,7 +184,7 @@ Useful for testing or immediately processing an existing queued job without wait
 recoverStuckJobs();
 ```
 
-Resets pending `SEND_RESULT` / failure-delivery jobs so the normal worker can inspect them again without deleting their generated artifacts.
+Resets pending `SEND_RESULT` / failure-delivery jobs so the normal worker can inspect them again without deleting their generated artifacts. Orphaned results are requeued for another lookup attempt.
 
 ### Clear a temporary Gmail pause
 
@@ -196,9 +202,19 @@ emergencyStop();
 
 Disables CodeAgent and removes the managed triggers while preserving existing Drive jobs.
 
-## 🧪 v8 Reliability Changes
+## 🧪 v9 Reliability Changes
 
-v8 was tested against the failure modes encountered during development. The most important changes are:
+v9 keeps the v8 architecture and closes the durability gaps that v8 could still hit. The most important changes are:
+
+- Failure notices resolve a recipient from the persisted job state, then the original Gmail thread, then the script owner. The previous release could call an undefined helper and retry the notice forever.
+- A missing result file is retried up to three times before a job is marked orphaned, and an orphaned job now notifies the user instead of waiting silently.
+- `recoverStuckJobs()` requeues orphaned results so a transient Drive problem can still end in a delivery.
+- Delivered message IDs are stored in the `PROCESSED_MESSAGE_IDS` script property, which prevents duplicate jobs when `markRead()` fails after a successful delivery.
+- Jobs older than seven days that have not produced a result are failed with a notice, which keeps the queue bounded.
+- Retry handling is stage-aware: an incomplete model response can no longer rewind the state machine from `SUMMARY` or `PROCESS` back to `FINALIZE`.
+- The state machine is covered by a Node test suite with an Apps Script shim (`npm test`).
+
+### v8 changes carried forward
 
 - Completion delivery uses the persisted `recipientEmail` instead of requiring the original Gmail thread to remain available.
 - A waiting job no longer prevents later jobs from being inspected.
@@ -207,6 +223,18 @@ v8 was tested against the failure modes encountered during development. The most
 - The coding prompt explicitly prohibits fabricated personal information.
 - Queue inspection is available through `inspectQueuedJobs()`.
 - Gmail quota failures are recorded in persistent state and retried instead of deleting the generated result.
+
+## 🧪 Tests
+
+The state machine and the Gmail/Drive edge cases are covered by a dependency-free Node test suite:
+
+```bash
+npm test
+```
+
+`tests/gas-shim.js` loads `code.gs` into a `vm` context with in-memory implementations of the Apps Script services CodeAgent uses (`PropertiesService`, `DriveApp`, `GmailApp`, `UrlFetchApp`, `ScriptApp`, `LockService`, `Session`). The tests then drive real CodeAgent functions; nothing in `code.gs` is mocked or stubbed.
+
+The suite covers chunk splitting, HTML extraction and validation, job creation and dedupe, the full `PROCESS → FINALIZE → SEND_RESULT` pipeline, failure-notice routing, Gmail quota pauses, orphaned-result recovery, job expiry, and queue diagnostics.
 
 ## ⚠️ Quotas & Limitations
 

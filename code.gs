@@ -1,11 +1,11 @@
 /**
  * =============================================================================
- * CodeAgent v8 — Google Apps Script
+ * CodeAgent v9 — Google Apps Script
  * =============================================================================
  *
  * Gmail -> persistent Drive queue -> Groq coding agent -> HTML preview
  *
- * v8 focuses on reliability, output integrity, and diagnostics:
+ * v9 keeps the v8 architecture and closes the remaining durability gaps:
  *   - SAFE BY DEFAULT: disabled until enableCodeAgent() is run.
  *   - Exactly TWO stable managed triggers when enabled:
  *       1) processCodeEmails — Gmail intake every 5 minutes.
@@ -25,6 +25,15 @@
  *   - Personal information is not invented by the coding prompt.
  *   - Stuck jobs can be manually recovered without deleting the generated file.
  *   - inspectQueuedJobs() provides detailed queue diagnostics.
+ *   - Failure notices resolve a recipient from the persisted job state, the
+ *     original Gmail thread, or the script owner, in that order.
+ *   - Result-file lookup failures are retried before a job is marked orphaned,
+ *     and orphaned jobs still notify the user instead of waiting forever.
+ *   - Delivered Gmail messages are remembered, so a failed markRead() cannot
+ *     create a duplicate job for the same message.
+ *   - Jobs that stay unfinished past MAX_JOB_AGE_MS are failed with a notice
+ *     instead of occupying the queue indefinitely.
+ *   - Retry counters are stage-aware: a retry never rewinds the state machine.
  *
  * IMPORTANT
  *   Replace your current CodeAgent code with this file. Run initializeCodeAgent()
@@ -40,6 +49,7 @@ const CONFIG = Object.freeze({
   GITHUB_OWNER_PROPERTY: 'GITHUB_OWNER',
   GITHUB_REPO_PROPERTY: 'GITHUB_REPO',
   SLACK_WEBHOOK_PROPERTY: 'SLACK_WEBHOOK_URL',
+  PROCESSED_MESSAGES_PROPERTY: 'PROCESSED_MESSAGE_IDS',
   API_URL: 'https://api.groq.com/openai/v1/chat/completions',
   GROQ_MODEL: 'openai/gpt-oss-120b',
   TPM_LIMIT: 8000,
@@ -48,6 +58,10 @@ const CONFIG = Object.freeze({
   OUTPUT_RESERVE_TOKENS: 1800,
   GROQ_BACKOFF_MS: 75 * 1000,
   MAX_RETRIES: 3,
+  MAX_FINALIZE_RETRIES: 2,
+  MAX_RESULT_LOOKUP_FAILURES: 3,
+  MAX_TRACKED_MESSAGES: 100,
+  MAX_JOB_AGE_MS: 7 * 24 * 60 * 60 * 1000,
   POLL_MINUTES: 5,
   WORKER_MINUTES: 1,
   GMAIL_QUOTA_PAUSE_MS: 12 * 60 * 60 * 1000,
@@ -102,6 +116,7 @@ function showCodeAgentStatus() {
     gmailQuotaPausedUntil: props.getProperty('GMAIL_QUOTA_PAUSED_UNTIL') || null,
     lastGmailError: props.getProperty('LAST_GMAIL_ERROR') || null,
     queuedJobs: countQueuedJobs_(), managedTriggers: managed,
+    trackedMessages: getTrackedMessageIds_().length,
     expectedTriggers: { processCodeEmails: 1, resumeJobs: 1 }
   }, null, 2));
 }
@@ -151,6 +166,11 @@ function initializeJobFromThread_(thread) {
     latestMessage = messages[messages.length - 1];
     const existing = findJobByMessage_(thread.getId(), latestMessage.getId());
     if (existing) { markThreadReadSafely_(thread); console.log(`Existing job ${existing.jobId} found for message; skipping duplicate creation.`); return true; }
+    if (wasMessageProcessed_(latestMessage.getId())) {
+      markThreadReadSafely_(thread);
+      console.log(`Message ${latestMessage.getId()} was already delivered; skipping duplicate creation.`);
+      return true;
+    }
     const instruction = (latestMessage.getPlainBody() || '').trim();
     const sourceText = collectSourceText_(latestMessage);
     if (!sourceText && !instruction) {
@@ -159,16 +179,16 @@ function initializeJobFromThread_(thread) {
     }
     const chunks = splitIntoChunks_(sourceText);
     const state = {
-      version: 8,
+      version: 9,
       jobId: `job_${Date.now()}_${Math.floor(Math.random() * 100000)}`,
       threadId: thread.getId(),
       messageId: latestMessage.getId(),
-      recipientEmail: extractEmailAddress_(latestMessage.getFrom()),
+      recipientEmail: resolveSenderEmail_(latestMessage),
       instruction, sourceText,
       fileSummary: sourceText ? 'Summary not generated yet.' : 'New file request.',
       chunks, processedParts: [], currentIndex: 0,
       stage: sourceText ? 'SUMMARY' : 'PROCESS', isChunked: chunks.length > 1,
-      retryCount: 0, finalizeRetryCount: 0, deliveryAttempts: 0,
+      retryCount: 0, finalizeRetryCount: 0, deliveryAttempts: 0, resultLookupFailures: 0,
       nextAttemptAt: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
     };
     const folder = getOrCreateJobFolder_();
@@ -221,6 +241,7 @@ function processSingleJob_(file, startTime) {
   try { state = JSON.parse(file.getBlob().getDataAsString()); }
   catch (err) { console.error(`Corrupted job ${file.getName()}; moving it to trash.`, err); file.setTrashed(true); return 'DONE'; }
   if (state.nextAttemptAt && Date.now() < Number(state.nextAttemptAt)) return 'WAIT';
+  if (isJobExpired_(state)) return expireJob_(file, state);
 
   if (state.stage === 'SUMMARY') {
     if (hasTimedOut_(startTime)) return 'WAIT';
@@ -262,7 +283,23 @@ function processSingleJob_(file, startTime) {
     if (!recipient) { state.deliveryAttempts = Number(state.deliveryAttempts || 0) + 1; state.deliveryError = 'No recipientEmail is stored for this job.'; state.nextAttemptAt = Date.now() + 10 * 60 * 1000; saveState_(file, state); console.error(`Job ${state.jobId}: ${state.deliveryError}`); return 'WAIT'; }
     let htmlFile;
     try { htmlFile = DriveApp.getFileById(state.resultFileId); }
-    catch (err) { state.deliveryError = `Result file ${state.resultFileId} could not be found: ${err}`; state.stage = 'ORPHANED_RESULT'; saveState_(file, state); console.error(`Job ${state.jobId}: ${state.deliveryError}`); return 'WAIT'; }
+    catch (err) {
+      const failures = Number(state.resultLookupFailures || 0) + 1;
+      state.resultLookupFailures = failures;
+      state.deliveryError = `Result file ${state.resultFileId} could not be read (attempt ${failures}): ${err}`;
+      if (failures >= CONFIG.MAX_RESULT_LOOKUP_FAILURES) {
+        state.stage = 'ORPHANED_RESULT';
+        state.failureReason = state.deliveryError;
+        state.nextAttemptAt = Date.now();
+        saveState_(file, state);
+        console.error(`Job ${state.jobId}: ${state.deliveryError}`);
+        return 'PROCESSED';
+      }
+      state.nextAttemptAt = Date.now() + 5 * 60 * 1000;
+      saveState_(file, state);
+      console.warn(`Job ${state.jobId}: ${state.deliveryError}`);
+      return 'WAIT';
+    }
     try {
       const finalHtml = htmlFile.getBlob().getDataAsString();
       const previewUrl = state.previewUrl || htmlFile.getUrl();
@@ -270,6 +307,7 @@ function processSingleJob_(file, startTime) {
       console.log(`Job ${state.jobId}: sending completion email directly to ${recipient}`);
       GmailApp.sendEmail(recipient, `CodeAgent result — ${state.jobId}`, `Your CodeAgent job ${state.jobId} is complete.\n\nOpen the live preview:\n${previewUrl}\n\nThe completed HTML file is attached.`, emailOptions);
       console.log(`Job ${state.jobId}: completion email successfully sent to ${recipient}`);
+      rememberProcessedMessage_(state.messageId);
       file.setTrashed(true); return 'DONE';
     } catch (err) {
       state.deliveryAttempts = Number(state.deliveryAttempts || 0) + 1; state.deliveryError = String(err);
@@ -280,7 +318,9 @@ function processSingleJob_(file, startTime) {
   }
 
   if (state.stage === 'FAILURE_PENDING') return processFailurePending_(file, state);
-  if (state.stage === 'ORPHANED_RESULT') return 'WAIT';
+  if (state.stage === 'ORPHANED_RESULT') {
+    return stageFailureForDelivery_(file, state, state.failureReason || 'The generated result file could not be found, so it could not be delivered.');
+  }
   return stageFailureForDelivery_(file, state, `Unknown job stage: ${state.stage}`);
 }
 
@@ -304,13 +344,13 @@ function handleChunkFailure_(file, state, result, index) {
 
 function handleModelFailure_(file, state, result, stageName) {
   const errorMessage = result && result.errorMessage ? result.errorMessage : 'Unknown model error.';
-  if (result && result.incomplete) {
+  const canRepairFinalize = state.stage === 'FINALIZE' && Array.isArray(state.processedParts) && state.processedParts.length > 0;
+  if (result && result.incomplete && canRepairFinalize) {
     const retries = Number(state.finalizeRetryCount || 0);
-    if (retries < 2) {
+    if (retries < CONFIG.MAX_FINALIZE_RETRIES) {
       state.finalizeRetryCount = retries + 1;
-      state.stage = 'FINALIZE';
       state.nextAttemptAt = Date.now() + 10000;
-      state.deliveryError = `Incomplete output during ${stageName}; retry ${state.finalizeRetryCount}/2.`;
+      state.deliveryError = `Incomplete output during ${stageName}; retry ${state.finalizeRetryCount}/${CONFIG.MAX_FINALIZE_RETRIES}.`;
       saveState_(file, state); console.warn(`Job ${state.jobId}: incomplete output; retrying ${stageName}.`); return 'WAIT';
     }
   }
@@ -331,31 +371,31 @@ function stageFailureForDelivery_(file, state, reason) {
   return 'PROCESSED';
 }
 
-function stageFailureForDelivery(file, state, reason) { return stageFailureForDelivery_(file, state, reason); }
-
 function processFailurePending_(file, state) {
   if (gmailQuotaPauseActive_()) return 'WAIT';
   const reason = state.failureReason || 'CodeAgent failed without a recorded reason.';
-  const recipient = String(state.recipientEmail || '').trim();
+  const parts = state.processedParts || [];
+  const options = parts.length ? { attachments: [Utilities.newBlob(parts.join('\n\n'), MimeType.HTML, 'partial_recovery.html')] } : {};
   try {
-    if (recipient) {
-      const parts = state.processedParts || [];
-      const options = parts.length ? { attachments: [Utilities.newBlob(parts.join('\n\n'), MimeType.HTML, 'partial_recovery.html')] } : {};
-      GmailApp.sendEmail(recipient, `CodeAgent needs attention — ${state.jobId}`, `CodeAgent could not finish job ${state.jobId}.\n\n${reason}`, options);
-    } else {
-      const message = loadOriginalMessageForJob_(state);
-      if (!message) { state.nextAttemptAt = Date.now() + 5 * 60 * 1000; saveState_(file, state); return 'WAIT'; }
-      sendFailureReply_(message, state, reason);
+    const recipient = resolveFailureRecipient_(state);
+    if (!recipient) {
+      const attempts = Number(state.failureAttempts || 0) + 1;
+      state.failureAttempts = attempts;
+      state.deliveryError = 'No recipient address is available for the failure notice.';
+      state.nextAttemptAt = Date.now() + Math.min(60 * 60 * 1000, 5 * 60 * 1000 * attempts);
+      saveState_(file, state);
+      console.error(`Job ${state.jobId}: ${state.deliveryError}`);
+      return 'WAIT';
     }
-    file.setTrashed(true); console.log(`Job ${state.jobId}: failure notification delivered.`); return 'DONE';
+    GmailApp.sendEmail(recipient, `CodeAgent needs attention — ${state.jobId}`, `CodeAgent could not finish job ${state.jobId}.\n\n${reason}`, options);
+    rememberProcessedMessage_(state.messageId);
+    file.setTrashed(true); console.log(`Job ${state.jobId}: failure notification delivered to ${recipient}.`); return 'DONE';
   } catch (err) {
     if (isGmailQuotaError_(err)) { pauseGmailAfterQuotaError_(err); state.nextAttemptAt = Date.now() + CONFIG.GMAIL_QUOTA_PAUSE_MS; }
     else state.nextAttemptAt = Date.now() + 5 * 60 * 1000;
     state.deliveryError = String(err); saveState_(file, state); console.error(`Job ${state.jobId}: failure notification failed:`, err); return 'WAIT';
   }
 }
-
-function handleFailurePendingIfNeeded_(file, state) { if (state.stage !== 'FAILURE_PENDING') return null; return processFailurePending_(file, state); }
 
 function collectSourceText_(msg) {
   let text = '';
@@ -403,14 +443,14 @@ function summarizeFilePurpose_(text) {
   return callGroq_({ model: CONFIG.GROQ_MODEL, max_completion_tokens: 300, messages: [{ role: 'system', content: 'Summarize this source code architecture and purpose in 2-3 concise sentences. Focus on major components, data flow, important APIs, and naming conventions. Do not rewrite code.' }, { role: 'user', content: preview }] });
 }
 
-function estimateTokensV8_(text) { return Math.max(1, Math.ceil(String(text || '').length / CONFIG.CHARS_PER_TOKEN_ESTIMATE)); }
-function getSafeCompletionBudgetV8_(promptText) { const promptTokens = estimateTokensV8_(promptText); const available = CONFIG.TPM_LIMIT - CONFIG.PROMPT_OVERHEAD_TOKENS - promptTokens; return Math.max(256, Math.min(3200, available)); }
+function estimateTokens_(text) { return Math.max(1, Math.ceil(String(text || '').length / CONFIG.CHARS_PER_TOKEN_ESTIMATE)); }
+function getSafeCompletionBudget_(promptText) { const promptTokens = estimateTokens_(promptText); const available = CONFIG.TPM_LIMIT - CONFIG.PROMPT_OVERHEAD_TOKENS - promptTokens; return Math.max(256, Math.min(3200, available)); }
 
 function processChunk_({ instruction, fileSummary, chunk, chunkIndex, totalChunks }) {
   const positionNote = totalChunks > 1 ? `This is part ${chunkIndex + 1} of ${totalChunks} of a larger source file.\nGlobal context: ${fileSummary}\n\nApply the user's instruction to THIS SECTION. Preserve existing names, APIs, conventions, and working logic. Do not add document wrappers unless this section already has them.\n\n` : '';
   const outputInstruction = totalChunks === 1 ? 'Return ONLY a complete standalone HTML document inside one HTML code block. It MUST end with </html>. Keep the output concise enough to finish within the token limit. Do not add explanations.' : 'Return only the transformed source fragment inside one HTML code block. Do not add commentary.';
   const prompt = positionNote + `USER INSTRUCTION:\n${instruction || '(Repair the supplied code while preserving its intended behavior.)'}\n\n` + `SOURCE SECTION:\n${chunk}\n\n` + `PERSONAL-DATA RULE: Never invent an email address, phone number, social profile, employer, credential, hobby, project, biography detail, or other personal fact. Only use personal information supplied by the user. Otherwise use a neutral placeholder or omit it.\n\n` + outputInstruction;
-  return callGroq_({ model: CONFIG.GROQ_MODEL, max_completion_tokens: getSafeCompletionBudgetV8_(prompt), messages: [{ role: 'system', content: 'You are an expert full-stack web developer and code repair agent. Preserve existing functionality, make targeted changes, and never invent personal information. For standalone HTML, always finish the complete document.' }, { role: 'user', content: prompt }] });
+  return callGroq_({ model: CONFIG.GROQ_MODEL, max_completion_tokens: getSafeCompletionBudget_(prompt), messages: [{ role: 'system', content: 'You are an expert full-stack web developer and code repair agent. Preserve existing functionality, make targeted changes, and never invent personal information. For standalone HTML, always finish the complete document.' }, { role: 'user', content: prompt }] });
 }
 
 function callGroq_(payload) {
@@ -436,7 +476,7 @@ function callGroq_(payload) {
   return { ok: true, generatedText: content };
 }
 
-function isCompleteHtmlV8_(html) {
+function isCompleteHtml_(html) {
   const text = String(html || '').trim();
   return !!text && /<html(?:\s|>)/i.test(text) && /<head(?:\s|>)/i.test(text) && /<body(?:\s|>)/i.test(text) && /<\/body>/i.test(text) && /<\/html>/i.test(text);
 }
@@ -446,23 +486,23 @@ function finalizeJob_(state) {
   if (!state.isChunked) {
     const html = extractHtml_(state.processedParts[0] || combined).trim();
     if (!html) return { ok: false, incomplete: false, rateLimited: false, errorMessage: 'No generated HTML was returned.' };
-    if (isCompleteHtmlV8_(html)) return { ok: true, html };
+    if (isCompleteHtml_(html)) return { ok: true, html };
     const repairPrompt = `Repair this potentially truncated HTML document.\nPreserve its current design and behavior. Do not invent personal information.\nReturn ONLY the complete standalone HTML document inside one HTML code block.\nThe final output MUST contain </body> and </html>.\n\nCURRENT OUTPUT:\n${html}`;
-    const repair = callGroq_({ model: CONFIG.GROQ_MODEL, max_completion_tokens: getSafeCompletionBudgetV8_(repairPrompt), messages: [{ role: 'system', content: 'Repair incomplete HTML. Return only a complete runnable document. Do not invent personal facts or contact details.' }, { role: 'user', content: repairPrompt }] });
-    if (repair.ok) { const repaired = extractHtml_(repair.generatedText || '').trim(); if (isCompleteHtmlV8_(repaired)) return { ok: true, html: repaired }; }
+    const repair = callGroq_({ model: CONFIG.GROQ_MODEL, max_completion_tokens: getSafeCompletionBudget_(repairPrompt), messages: [{ role: 'system', content: 'Repair incomplete HTML. Return only a complete runnable document. Do not invent personal facts or contact details.' }, { role: 'user', content: repairPrompt }] });
+    if (repair.ok) { const repaired = extractHtml_(repair.generatedText || '').trim(); if (isCompleteHtml_(repaired)) return { ok: true, html: repaired }; }
     if (repair.rateLimited) return repair;
     return { ok: false, incomplete: true, rateLimited: false, errorMessage: 'Generated HTML was incomplete and the repair pass did not finish it.' };
   }
   const mergePrompt = `Original task: ${state.instruction}\nGlobal context: ${state.fileSummary}\nNever invent personal facts or contact information.\n\nMerge the fragments into one cohesive runnable HTML document. Preserve functionality, remove duplicate wrappers, repair obvious seams, and return a complete document ending with </html>.\n\nFRAGMENTS:\n${combined}`;
-  const mergeTokens = estimateTokensV8_(mergePrompt);
+  const mergeTokens = estimateTokens_(mergePrompt);
   const canMerge = mergeTokens + CONFIG.PROMPT_OVERHEAD_TOKENS + 900 <= CONFIG.TPM_LIMIT;
   if (canMerge) {
-    const result = callGroq_({ model: CONFIG.GROQ_MODEL, max_completion_tokens: getSafeCompletionBudgetV8_(mergePrompt), messages: [{ role: 'system', content: 'Merge transformed fragments into one complete runnable HTML document. Preserve functionality and do not invent personal information.' }, { role: 'user', content: mergePrompt }] });
-    if (result.ok) { const html = extractHtml_(result.generatedText || '').trim(); if (isCompleteHtmlV8_(html)) return { ok: true, html }; }
+    const result = callGroq_({ model: CONFIG.GROQ_MODEL, max_completion_tokens: getSafeCompletionBudget_(mergePrompt), messages: [{ role: 'system', content: 'Merge transformed fragments into one complete runnable HTML document. Preserve functionality and do not invent personal information.' }, { role: 'user', content: mergePrompt }] });
+    if (result.ok) { const html = extractHtml_(result.generatedText || '').trim(); if (isCompleteHtml_(html)) return { ok: true, html }; }
     if (result.rateLimited) return result;
   }
   const fallback = /<html[\s>]/i.test(combined) ? combined : '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n</head>\n<body>\n' + combined + '\n</body>\n</html>';
-  if (!isCompleteHtmlV8_(fallback)) return { ok: false, incomplete: true, rateLimited: false, errorMessage: 'Chunked output could not be assembled into a complete HTML document.' };
+  if (!isCompleteHtml_(fallback)) return { ok: false, incomplete: true, rateLimited: false, errorMessage: 'Chunked output could not be assembled into a complete HTML document.' };
   return { ok: true, html: fallback };
 }
 
@@ -487,37 +527,39 @@ function buildEmailBody_(previewUrl, wasChunked, chunkCount, jobId) {
   return `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;padding:24px;background:#f9fafb;border-radius:12px;border:1px solid #e5e7eb;max-width:600px;"><h2 style="color:#111827;margin-top:0;font-size:20px;">🎉 Your Code is Ready!</h2><p style="color:#4b5563;font-size:15px;line-height:1.5;">CodeAgent finished job <strong>${escapeHtml_(jobId)}</strong>.</p>${chunkNote}<div style="margin:24px 0;"><a href="${escapeHtml_(previewUrl)}" target="_blank" rel="noopener noreferrer" style="background-color:#2563eb;color:#ffffff;padding:12px 24px;text-decoration:none;border-radius:8px;font-weight:600;font-size:15px;display:inline-block;">🚀 Open Live Preview</a></div><hr style="border:0;border-top:1px solid #e5e7eb;margin:20px 0;" /><p style="color:#9ca3af;font-size:13px;margin:0;">📎 The completed HTML file is attached.</p></div>`;
 }
 
-function sendFailureReply_(message, state, reason) {
-  const parts = state.processedParts || [];
-  const options = parts.length ? { attachments: [Utilities.newBlob(parts.join('\n\n'), MimeType.HTML, 'partial_recovery.html')] } : {};
-  message.reply(`🤖 CodeAgent stopped safely.\n\n${reason}\n\n` + `Completed portions are attached when available. Job: ${state.jobId}`, options);
-}
-
 function escapeHtml_(value) {
   return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-function resolveDeliveryTargetForJob_(state) {
-  if (gmailQuotaPauseActive_()) return null;
-  let thread = null;
-  try { if (state.threadId) thread = GmailApp.getThreadById(state.threadId); }
-  catch (err) { if (isGmailQuotaError_(err)) pauseGmailAfterQuotaError_(err); else console.error(`Job ${state.jobId}: Gmail thread lookup failed:`, err); }
+function resolveSenderEmail_(message) {
+  let from = '';
+  try { from = message.getFrom(); } catch (err) { console.warn('Could not read message sender:', err); }
+  return extractEmailAddress_(from) || getOwnerEmail_();
+}
+
+function resolveFailureRecipient_(state) {
+  const stored = String(state.recipientEmail || '').trim();
+  if (stored) return stored;
+  const thread = getThreadSafely_(state.threadId);
   if (thread) {
     try {
       const messages = thread.getMessages();
       if (messages && messages.length) {
         const exact = state.messageId ? messages.find(m => m.getId() === state.messageId) : null;
         const message = exact || messages[messages.length - 1];
-        if (message) {
-          let recipient = '';
-          try { recipient = extractEmailAddress_(message.getFrom()); } catch (_) {}
-          return { message, recipient };
-        }
+        const from = extractEmailAddress_(message.getFrom());
+        if (from) return from;
       }
-    } catch (err) { if (isGmailQuotaError_(err)) pauseGmailAfterQuotaError_(err); else console.error(`Job ${state.jobId}: Gmail message lookup failed:`, err); }
+    } catch (err) {
+      if (isGmailQuotaError_(err)) pauseGmailAfterQuotaError_(err); else console.error(`Job ${state.jobId}: Gmail message lookup failed:`, err);
+    }
   }
-  if (state.recipientEmail) return { message: null, recipient: state.recipientEmail };
-  return null;
+  return getOwnerEmail_();
+}
+
+function getOwnerEmail_() {
+  try { return Session.getEffectiveUser().getEmail() || ''; }
+  catch (err) { console.warn('Script owner email is unavailable:', err); return ''; }
 }
 
 function extractEmailAddress_(fromField) {
@@ -527,15 +569,42 @@ function extractEmailAddress_(fromField) {
 }
 
 function getThreadSafely_(threadId) {
+  if (!threadId) return null;
   try { return GmailApp.getThreadById(threadId); }
   catch (err) { if (isGmailQuotaError_(err)) pauseGmailAfterQuotaError_(err); else console.error('getThreadSafely_ failed:', err); return null; }
 }
 
-function getMessageSafely_(thread, messageId) {
+function getTrackedMessageIds_() {
+  const raw = getScriptProperties_().getProperty(CONFIG.PROCESSED_MESSAGES_PROPERTY);
+  if (!raw) return [];
   try {
-    const messages = thread.getMessages();
-    return messages.find(m => m.getId() === messageId) || messages[messages.length - 1] || null;
-  } catch (err) { if (isGmailQuotaError_(err)) pauseGmailAfterQuotaError_(err); else console.error('getMessageSafely_ failed:', err); return null; }
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(id => typeof id === 'string') : [];
+  } catch (_) { return []; }
+}
+
+function wasMessageProcessed_(messageId) {
+  return !!messageId && getTrackedMessageIds_().indexOf(messageId) !== -1;
+}
+
+function rememberProcessedMessage_(messageId) {
+  if (!messageId) return;
+  const ids = getTrackedMessageIds_().filter(id => id !== messageId);
+  ids.push(messageId);
+  const trimmed = ids.slice(Math.max(0, ids.length - CONFIG.MAX_TRACKED_MESSAGES));
+  try { getScriptProperties_().setProperty(CONFIG.PROCESSED_MESSAGES_PROPERTY, JSON.stringify(trimmed)); }
+  catch (err) { console.warn('Could not persist processed message id:', err); }
+}
+
+function isJobExpired_(state) {
+  const created = Date.parse(state.createdAt || '');
+  if (!Number.isFinite(created)) return false;
+  if (['SEND_RESULT', 'RETRY_DRIVE', 'FAILURE_PENDING', 'ORPHANED_RESULT'].indexOf(state.stage) !== -1) return false;
+  return Date.now() - created > CONFIG.MAX_JOB_AGE_MS;
+}
+
+function expireJob_(file, state) {
+  return stageFailureForDelivery_(file, state, `Job ${state.jobId} exceeded the ${Math.round(CONFIG.MAX_JOB_AGE_MS / (24 * 60 * 60 * 1000))}-day queue lifetime before it finished.`);
 }
 
 function markThreadReadSafely_(thread) {
@@ -618,6 +687,10 @@ function recoverStuckJobs() {
     const file = files.next();
     try {
       const state = JSON.parse(file.getBlob().getDataAsString());
+      if (state.stage === 'ORPHANED_RESULT') {
+        state.stage = 'SEND_RESULT';
+        state.resultLookupFailures = 0;
+      }
       if (state.stage === 'SEND_RESULT' || state.stage === 'FAILURE_PENDING') {
         state.nextAttemptAt = Date.now();
         state.deliveryError = state.deliveryError || 'Manual recovery requested.';
@@ -642,6 +715,8 @@ function inspectQueuedJobs() {
         currentIndex: Number(state.currentIndex || 0),
         totalChunks: Array.isArray(state.chunks) ? state.chunks.length : 0,
         finalizeRetryCount: Number(state.finalizeRetryCount || 0), deliveryAttempts: Number(state.deliveryAttempts || 0),
+        resultLookupFailures: Number(state.resultLookupFailures || 0), resultFileId: state.resultFileId || null,
+        createdAt: state.createdAt || null,
         recipientEmail: state.recipientEmail || null, deliveryError: state.deliveryError || null, failureReason: state.failureReason || null
       });
     } catch (err) { jobs.push({ fileName: file.getName(), error: String(err) }); }
