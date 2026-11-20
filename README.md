@@ -19,7 +19,7 @@ CodeAgent turns an email into a persistent coding job: it reads your instruction
 - **✅ Output validation** — CodeAgent checks generated standalone HTML for required document structure and attempts a repair pass when the model truncates its output.
 - **🧠 Safer prompting** — CodeAgent explicitly tells the model not to invent personal contact details, credentials, employers, hobbies, or other personal facts.
 - **🔎 Queue diagnostics** — `inspectQueuedJobs()` exposes job state, retry timestamps, delivery attempts, result-lookup failures, and recorded errors.
-- **📬 Reliable failure notices** — failures are emailed to the persisted recipient, then the thread sender, then the script owner, so a job never dies silently.
+- **📬 Reliable failure notices** — failures are emailed to the persisted recipient, then the sender of the original message, then the script owner, so a job never dies silently and never reaches an unrelated thread participant.
 - **♻️ Orphan recovery** — a result file that cannot be read is retried, then reported instead of waiting forever; `recoverStuckJobs()` requeues it for another attempt.
 - **🚫 No duplicate jobs** — delivered message IDs are remembered, so a failed `markRead()` cannot make the same email run twice.
 - **⏳ Bounded queue lifetime** — jobs that stay unfinished for seven days are failed with a notice instead of occupying the queue.
@@ -206,7 +206,7 @@ Disables CodeAgent and removes the managed triggers while preserving existing Dr
 
 v9 keeps the v8 architecture and closes the durability gaps that v8 could still hit. The most important changes are:
 
-- Failure notices resolve a recipient from the persisted job state, then the original Gmail thread, then the script owner. The previous release could call an undefined helper and retry the notice forever.
+- Failure notices resolve a recipient from the persisted job state, then the sender of the original message, then the script owner. The previous release could call an undefined helper and retry the notice forever; the thread's latest participant is never used, so a forwarded thread cannot leak a partial result.
 - A missing result file is retried up to three times before a job is marked orphaned, and an orphaned job now notifies the user instead of waiting silently.
 - `recoverStuckJobs()` requeues orphaned results so a transient Drive problem can still end in a delivery.
 - Delivered message IDs are stored in the `PROCESSED_MESSAGE_IDS` script property, which prevents duplicate jobs when `markRead()` fails after a successful delivery.

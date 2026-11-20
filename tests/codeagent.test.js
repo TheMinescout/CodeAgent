@@ -169,6 +169,26 @@ test('failure notices fall back to the script owner', () => {
   assert.equal(env.sentEmails[0].recipient, 'owner@example.com');
 });
 
+test('a failure notice is never routed to an unrelated thread participant', () => {
+  const env = setup({ ownerEmail: 'owner@example.com' });
+  env.addThread({
+    id: 'thread_1',
+    messages: [
+      { id: 'message_original', from: 'The User <user@example.com>', plainBody: 'hi' },
+      { id: 'message_forwarded', from: 'Someone Else <else@example.com>', plainBody: 'fwd' }
+    ]
+  });
+  const { file } = env.createJob(makeJob({
+    stage: 'FAILURE_PENDING',
+    recipientEmail: '',
+    messageId: 'message_missing',
+    failureReason: 'boom'
+  }));
+
+  assert.equal(env.context.processSingleJob_(file, Date.now()), 'DONE');
+  assert.equal(env.sentEmails[0].recipient, 'owner@example.com');
+});
+
 test('a failure notice with no reachable recipient is retried, not lost', () => {
   const env = setup({ ownerEmail: '' });
   const { file } = env.createJob(makeJob({ stage: 'FAILURE_PENDING', recipientEmail: '', threadId: 'gone', failureReason: 'boom' }));

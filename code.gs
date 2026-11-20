@@ -540,14 +540,12 @@ function resolveSenderEmail_(message) {
 function resolveFailureRecipient_(state) {
   const stored = String(state.recipientEmail || '').trim();
   if (stored) return stored;
-  const thread = getThreadSafely_(state.threadId);
+  const thread = state.messageId ? getThreadSafely_(state.threadId) : null;
   if (thread) {
     try {
-      const messages = thread.getMessages();
-      if (messages && messages.length) {
-        const exact = state.messageId ? messages.find(m => m.getId() === state.messageId) : null;
-        const message = exact || messages[messages.length - 1];
-        const from = extractEmailAddress_(message.getFrom());
+      const original = thread.getMessages().find(message => message.getId() === state.messageId);
+      if (original) {
+        const from = extractEmailAddress_(original.getFrom());
         if (from) return from;
       }
     } catch (err) {
